@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from utils.diversity_loss import PrototypeDiversityLoss
 from utils.trainutils import get_cls_dataset
 from utils.optimizer import PolyWarmupAdamW
 from utils.pyutils import set_seed,AverageMeter
@@ -90,9 +91,10 @@ def train(cfg):
     model = ClsNetwork(backbone=cfg.model.backbone.config,
                     stride=cfg.model.backbone.stride,
                     cls_num_classes=cfg.dataset.cls_num_classes,
+                    num_prototypes_per_class=cfg.model.num_prototypes_per_class,
+                    prototype_feature_dim=cfg.model.prototype_feature_dim,
                     n_ratio=cfg.model.n_ratio,
-                    pretrained=cfg.train.pretrained,
-                    l_fea_path=cfg.model.label_feature_path)
+                    pretrained=cfg.train.pretrained)
     
     # Mixed precision training setup
     iters_per_epoch = len(train_loader)
@@ -117,18 +119,24 @@ def train(cfg):
     )
 
     # Loss functions and feature extractor setup
+    # Classification Loss
     loss_function = nn.BCEWithLogitsLoss().to(device)
+    
+    # Contrastive Loss components
     mask_adapter = MaskAdapter_DynamicThreshold(alpha=cfg.train.mask_adapter_alpha,)
     feature_extractor = FeatureExtractor(mask_adapter=mask_adapter)
     fg_loss_fn = InfoNCELossFG(temperature=0.07).to(device)
     bg_loss_fn = InfoNCELossBG(temperature=0.07).to(device)
-    best_fuse234_dice = 0.0
+    
+    # Diversity Loss
+    diversity_loss_fn = PrototypeDiversityLoss(num_prototypes_per_class=cfg.model.num_prototypes_per_class).to(device)
 
     print("\nStarting training...")
     train_loader_iter = iter(train_loader)
     
     for n_iter in range(cfg.train.max_iters):
         try:
+            # We now need the pixel-wise ground truth `gt_label` for the diversity loss
             img_name, inputs, cls_labels, gt_label = next(train_loader_iter)
         except StopIteration:
             train_loader_iter = iter(train_loader)
@@ -136,40 +144,55 @@ def train(cfg):
 
         inputs = inputs.to(device).float()
         cls_labels = cls_labels.to(device).float()
+        gt_label = gt_label.to(device) # Send ground truth mask to device
         
         with torch.cuda.amp.autocast():
-            cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list = model(inputs)
+            # Unpack the new return value from the model
+            (cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, 
+             l_fea, k_list, feature_map_for_diversity) = model(inputs)
 
-            # Merge subclass predictions to parent class predictions
+            # --- Classification Loss (L_CLS) ---
             cls1_merge = merge_to_parent_predictions(cls1, k_list, method=cfg.train.merge_train)
             cls2_merge = merge_to_parent_predictions(cls2, k_list, method=cfg.train.merge_train)
             cls3_merge = merge_to_parent_predictions(cls3, k_list, method=cfg.train.merge_train)
             cls4_merge = merge_to_parent_predictions(cls4, k_list, method=cfg.train.merge_train)
-
-            # Generate binary masks for feature extraction
-            subclass_labels = expand_parent_to_subclass_labels(cls_labels, k_list)
-            cls4_expand=expand_parent_to_subclass_labels(cls4_merge, k_list)
-            cls4_bir=(cls4>cls4_expand).float()*subclass_labels
-
-            # Extract foreground and background features
-            batch_info = feature_extractor.process_batch(inputs, cam4, cls4_bir, clip_model)
-            fg_features, bg_features = batch_info['fg_features'], batch_info['bg_features']
-
-            # Pair features with text embeddings
-            set_info = pair_features(fg_features, bg_features, l_fea, cls4_bir)
-            fg_features, bg_features, fg_pro, bg_pro = set_info['fg_features'], set_info['bg_features'], set_info['fg_text'], set_info['bg_text']
-                
-            # Compute contrastive losses
-            fg_loss = fg_loss_fn(fg_features, fg_pro, bg_pro)
-            bg_loss = bg_loss_fn(bg_features, fg_pro, bg_pro)
             
-            # Multi-scale classification losses
             loss1 = loss_function(cls1_merge, cls_labels)
             loss2 = loss_function(cls2_merge, cls_labels)
             loss3 = loss_function(cls3_merge, cls_labels)
             loss4 = loss_function(cls4_merge, cls_labels)
             cls_loss = cfg.train.l1 * loss1 + cfg.train.l2 * loss2 + cfg.train.l3 * loss3 + cfg.train.l4 * loss4
-            loss = cls_loss + (fg_loss + bg_loss + 0.0005*torch.mean(cam4)) * cfg.train.l5
+
+            # --- Contrastive Loss (L_SIM) ---
+            subclass_labels = expand_parent_to_subclass_labels(cls_labels, k_list)
+            cls4_expand=expand_parent_to_subclass_labels(cls4_merge, k_list)
+            cls4_bir=(cls4>cls4_expand).float()*subclass_labels
+
+            batch_info = feature_extractor.process_batch(inputs, cam4, cls4_bir, clip_model)
+            
+            contrastive_loss = torch.tensor(0.0, device=device)
+            if batch_info is not None:
+                fg_features, bg_features = batch_info['fg_features'], batch_info['bg_features']
+                set_info = pair_features(fg_features, bg_features, l_fea, cls4_bir)
+                fg_features, bg_features, fg_pro, bg_pro = set_info['fg_features'], set_info['bg_features'], set_info['fg_text'], set_info['bg_text']
+                fg_loss = fg_loss_fn(fg_features, fg_pro, bg_pro)
+                bg_loss = bg_loss_fn(bg_features, fg_pro, bg_pro)
+                contrastive_loss = fg_loss + bg_loss
+
+            # --- Diversity Loss (L_J) ---
+            # We need to resize the ground truth mask to match the feature map dimensions
+            gt_mask_resized = F.interpolate(gt_label.unsqueeze(1).float(), 
+                                            size=feature_map_for_diversity.shape[2:], 
+                                            mode='nearest').squeeze(1).long()
+            
+            diversity_loss = diversity_loss_fn(feature_map_for_diversity, l_fea, gt_mask_resized)
+
+            # --- Total Loss ---
+            # Total Loss = L_CLS + lambda_sim * L_SIM + lambda_j * L_J
+            lambda_sim = cfg.train.l5 # Weight for contrastive loss
+            lambda_j = cfg.train.lambda_j # Add this to your config file
+            
+            loss = cls_loss + lambda_sim * (contrastive_loss + 0.0005*torch.mean(cam4)) + lambda_j * diversity_loss
 
         # Gradient scaling for mixed precision
         optimizer.zero_grad(set_to_none=True)  # More efficient gradient clearing 5358

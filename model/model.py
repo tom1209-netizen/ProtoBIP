@@ -8,7 +8,9 @@ from timm.models.layers import trunc_normal_
 
 from model.segform import mix_transformer
 
-# A simple MLP to project prototype features to the correct dimension
+# A simple MLP to project prototype features to the correct dimension.
+# This is still required to map the single set of learnable prototypes
+# to the different feature dimensions of the four backbone scales.
 class AdaptiveLayer(nn.Module):
     def __init__(self, in_dim, n_ratio, out_dim):
         super().__init__()
@@ -37,53 +39,55 @@ class AdaptiveLayer(nn.Module):
 
 class ClsNetwork(nn.Module):
     def __init__(self,
-                 backbone='mit_b1', # Uses SegFormer's Mix Transformer as the backbone
+                 backbone='mit_b1',
                  cls_num_classes=4,
                  num_prototypes_per_class=10,
+                 prototype_feature_dim=512,
                  stride=[4, 2, 2, 1],
                  pretrained=True,
-                 n_ratio=0.5,
-                 l_fea_path=None):
+                 n_ratio=0.5): # l_fea_path is no longer needed
         super().__init__()
         self.cls_num_classes = cls_num_classes
         self.num_prototypes_per_class = num_prototypes_per_class
+        self.total_prototypes = cls_num_classes * num_prototypes_per_class
         self.stride = stride
 
+        # Backbone Encoder (Same as original)
         self.encoder = getattr(mix_transformer, backbone)(stride=self.stride)
         self.in_channels = self.encoder.embed_dims
 
-        # Loads pre-trained weights for the backbone
-        # initialize encoder
+        # Loads pre-trained weights for the backbone (Same as original)
         if pretrained:
             state_dict = torch.load('./pretrained/'+backbone+'.pth', map_location="cpu")
-            state_dict.pop('head.weight')
-            state_dict.pop('head.bias')
+            state_dict.pop('head.weight', None)
+            state_dict.pop('head.bias', None)
             state_dict = {k: v for k, v in state_dict.items() if k in self.encoder.state_dict().keys()}
             self.encoder.load_state_dict(state_dict, strict=False)
 
+        # Learnable Prototypes 
+        # Instead of loading from a file, we create prototypes as a learnable parameter
+        # The optimizer will update these vectors during training
+        self.prototypes = nn.Parameter(torch.randn(self.total_prototypes, prototype_feature_dim), requires_grad=True)
+
+        # Adaptive Layers to Project Prototypes 
+        # These now project the learnable prototypes to match each of the four feature scales
+        self.l_fc1 = AdaptiveLayer(prototype_feature_dim, n_ratio, self.in_channels[0])
+        self.l_fc2 = AdaptiveLayer(prototype_feature_dim, n_ratio, self.in_channels[1])
+        self.l_fc3 = AdaptiveLayer(prototype_feature_dim, n_ratio, self.in_channels[2])
+        self.l_fc4 = AdaptiveLayer(prototype_feature_dim, n_ratio, self.in_channels[3])
+
+        # Other components from the original model are kept for compatibility
         self.pooling = F.adaptive_avg_pool2d
-
-        # Creates adaptive layers (MLPs) to project the 512-dim MedCLIP prototypes
-        # to the dimensions of the features at each of the 4 stages of the SegFormer backbone
-        self.l_fc1 = AdaptiveLayer(512, n_ratio, self.in_channels[0])
-        self.l_fc2 = AdaptiveLayer(512, n_ratio, self.in_channels[1])
-        self.l_fc3 = AdaptiveLayer(512, n_ratio, self.in_channels[2])
-        self.l_fc4 = AdaptiveLayer(512, n_ratio, self.in_channels[3])
-
-        # Loads the prototype features created by k_mean_cos_per_class.py
-        with open("./features/image_features/{}.pkl".format(l_fea_path), "rb") as lf:
-            info = pkl.load(lf)
-            self.l_fea = info['features'].cpu() # These are the prototype features P
-            self.k_list = info['k_list'] # Stores how many prototypes per class
-            self.cumsum_k = info['cumsum_k']
-            
-        self.total_classes = sum(self.k_list) # Total number of prototypes
-
-        # These are learnable temperature parameters for the contrastive loss, similar to 'τ' in the paper
-        self.logit_scale1 = nn.parameter.Parameter(torch.ones([1]) * 1 / 0.07)
-        self.logit_scale2 = nn.parameter.Parameter(torch.ones([1]) * 1 / 0.07)
-        self.logit_scale3 = nn.parameter.Parameter(torch.ones([1]) * 1 / 0.07)
-        self.logit_scale4 = nn.parameter.Parameter(torch.ones([1]) * 1 / 0.07)
+        
+        # The k_list (number of prototypes per class) is now generated programmatically.
+        # This is needed by the loss function in the training script.
+        self.k_list = [self.num_prototypes_per_class] * self.cls_num_classes
+        
+        # The learnable temperature parameters for cosine similarity are kept.
+        self.logit_scale1 = nn.parameter.Parameter(torch.ones([1]) * (1 / 0.07))
+        self.logit_scale2 = nn.parameter.Parameter(torch.ones([1]) * (1 / 0.07))
+        self.logit_scale3 = nn.parameter.Parameter(torch.ones([1]) * (1 / 0.07))
+        self.logit_scale4 = nn.parameter.Parameter(torch.ones([1]) * (1 / 0.07))
 
 
     def get_param_groups(self):
@@ -101,53 +105,59 @@ class ClsNetwork(nn.Module):
 
     def forward(self, x):
         # Passes the input image through the SegFormer backbone to get multi-scale feature maps
-        _x, _attns = self.encoder(x) 
+        _x_all, _ = self.encoder(x) 
 
-        logit_scale1 = self.logit_scale1
-        logit_scale2 = self.logit_scale2
-        logit_scale3 = self.logit_scale3
-        logit_scale4 = self.logit_scale4
-
-        imshape = [_.shape for _ in _x]
-
+        imshapes = [f.shape for f in _x_all]
+        
         # Flattens the feature maps from [B, C, H, W] to [B*H*W, C] for matching
-        image_features = [_.permute(0, 2, 3, 1).reshape(-1, _.shape[1]) for _ in _x]   
+        image_features = [f.permute(0, 2, 3, 1).reshape(-1, f.shape[1]) for f in _x_all]
         _x1, _x2, _x3, _x4 = image_features
     
-        # Projects the loaded prototypes to match the feature dimensions at each scale
-        l_fea = self.l_fea.to(x.device)
-        l_fea1 = self.l_fc1(l_fea)
-        l_fea2 = self.l_fc2(l_fea)
-        l_fea3 = self.l_fc3(l_fea)
-        l_fea4 = self.l_fc4(l_fea)
+        # Projects the single set of learnable prototypes to match the feature dimensions at each scale
+        projected_p1 = self.l_fc1(self.prototypes)
+        projected_p2 = self.l_fc2(self.prototypes)
+        projected_p3 = self.l_fc3(self.prototypes)
+        projected_p4 = self.l_fc4(self.prototypes)
         
+        # --- Scale 1 Calculation ---
         # Normalize pixel features for cosine similarity calculation
-        _x1 = _x1 / _x1.norm(dim=-1, keepdim=True)
-        # Calculate cosine similarity between each pixel feature and all prototype features
-        # This is a matrix multiplication between pixel features and transposed prototype features
-        logits_per_image1 = logit_scale1 * _x1 @ l_fea1.t().float()
-        # Reshape the output back into a map [B, C, H, W], which is the initial pseudo-mask M 
-        out1 = logits_per_image1.view(imshape[0][0], imshape[0][2], imshape[0][3], -1).permute(0, 3, 1, 2) 
+        _x1_norm = _x1 / _x1.norm(dim=-1, keepdim=True)
+        # Normalize the projected prototypes as well for true cosine similarity
+        p1_norm = projected_p1 / projected_p1.norm(dim=-1, keepdim=True)
+        # Calculate cosine similarity between each pixel feature and all projected prototypes
+        logits1 = self.logit_scale1 * _x1_norm @ p1_norm.t().float()
+        # Reshape the output back into a map [B, C, H, W], where C is the total number of prototypes
+        out1 = logits1.view(imshapes[0][0], imshapes[0][2], imshapes[0][3], -1).permute(0, 3, 1, 2) 
         cam1 = out1.clone().detach() # The Class Activation Map (CAM)
         # Apply Global Average Pooling to the CAM to get the image-level classification score
-        cls1 = self.pooling(out1, (1, 1)).view(-1, self.total_classes)
+        cls1 = self.pooling(out1, (1, 1)).view(-1, self.total_prototypes)
 
-        _x2 = _x2 / _x2.norm(dim=-1, keepdim=True)
-        logits_per_image2 = logit_scale2 * _x2 @ l_fea2.t().float() 
-        out2 = logits_per_image2.view(imshape[1][0], imshape[1][2], imshape[1][3], -1).permute(0, 3, 1, 2) 
+        # --- Scale 2 Calculation ---
+        _x2_norm = _x2 / _x2.norm(dim=-1, keepdim=True)
+        p2_norm = projected_p2 / projected_p2.norm(dim=-1, keepdim=True)
+        logits2 = self.logit_scale2 * _x2_norm @ p2_norm.t().float() 
+        out2 = logits2.view(imshapes[1][0], imshapes[1][2], imshapes[1][3], -1).permute(0, 3, 1, 2) 
         cam2 = out2.clone().detach()
-        cls2 = self.pooling(out2, (1, 1)).view(-1, self.total_classes)
+        cls2 = self.pooling(out2, (1, 1)).view(-1, self.total_prototypes)
 
-        _x3 = _x3 / _x3.norm(dim=-1, keepdim=True)
-        logits_per_image3 = logit_scale3 * _x3 @ l_fea3.t().float() 
-        out3 = logits_per_image3.view(imshape[2][0], imshape[2][2], imshape[2][3], -1).permute(0, 3, 1, 2) 
+        # --- Scale 3 Calculation ---
+        _x3_norm = _x3 / _x3.norm(dim=-1, keepdim=True)
+        p3_norm = projected_p3 / projected_p3.norm(dim=-1, keepdim=True)
+        logits3 = self.logit_scale3 * _x3_norm @ p3_norm.t().float() 
+        out3 = logits3.view(imshapes[2][0], imshapes[2][2], imshapes[2][3], -1).permute(0, 3, 1, 2) 
         cam3 = out3.clone().detach()
-        cls3 = self.pooling(out3, (1, 1)).view(-1, self.total_classes)
+        cls3 = self.pooling(out3, (1, 1)).view(-1, self.total_prototypes)
 
-        _x4 = _x4 / _x4.norm(dim=-1, keepdim=True)
-        logits_per_image4 = logit_scale4 * _x4 @ l_fea4.t().float() 
-        out4 = logits_per_image4.view(imshape[3][0], imshape[3][2], imshape[3][3], -1).permute(0, 3, 1, 2) 
+        # --- Scale 4 Calculation  ---
+        _x4_norm = _x4 / _x4.norm(dim=-1, keepdim=True)
+        p4_norm = projected_p4 / projected_p4.norm(dim=-1, keepdim=True)
+        logits4 = self.logit_scale4 * _x4_norm @ p4_norm.t().float() 
+        out4 = logits4.view(imshapes[3][0], imshapes[3][2], imshapes[3][3], -1).permute(0, 3, 1, 2) 
+        # For the final layer's CAM, we keep the gradient attached for the contrastive loss
         cam4 = out4.clone()
-        cls4 = self.pooling(out4, (1, 1)).view(-1, self.total_classes)
+        cls4 = self.pooling(out4, (1, 1)).view(-1, self.total_prototypes)
 
-        return cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, self.k_list
+        feature_map_for_diversity = _x_all[3]
+
+        return (cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, 
+                self.prototypes, self.k_list, feature_map_for_diversity)

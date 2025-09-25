@@ -29,6 +29,7 @@ train:
   l3: 1.0
   l4: 1.0
   l5: 0.1
+  lambda_j: 0.25 # Weight for the prototype diversity loss
   mask_adapter_alpha: 0.5
   merge_train: mean
   merge_test: max
