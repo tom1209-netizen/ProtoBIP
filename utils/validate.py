@@ -62,7 +62,8 @@ def validate(model=None, data_loader=None, cfg=None, cls_loss_func=None):
             labels = labels.cuda()
             cls_label = cls_label.cuda().float()
 
-            cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list = model(inputs, )
+            (cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, 
+             l_fea, k_list, _) = model(inputs)
 
             cls1 = merge_to_parent_predictions(cls1, k_list, method=cfg.train.merge_test)
             cls2 = merge_to_parent_predictions(cls2, k_list, method=cfg.train.merge_test)
