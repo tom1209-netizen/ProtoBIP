@@ -88,7 +88,7 @@ def validate(model=None, data_loader=None, cfg=None, cls_loss_func=None):
             cams4 = []
             for tta_trans in tta_transform:
                 augmented_tensor = tta_trans.augment_image(inputs)
-                cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list = model(augmented_tensor)
+                (cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list, _) = model(augmented_tensor)
 
                 cam1 = merge_subclass_cams_to_parent(cam1, k_list, method=cfg.train.merge_test)
                 cam2 = merge_subclass_cams_to_parent(cam2, k_list, method=cfg.train.merge_test)
@@ -145,7 +145,7 @@ def generate_cam(model=None, data_loader=None, cfg=None, cls_loss_func=None):
             labels = labels.cuda()
             cls_label = cls_label.cuda().float()
 
-            cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list = model(inputs, )
+            (cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list, _) = model(inputs)
 
             cam1 = merge_subclass_cams_to_parent(cam1, k_list, method=cfg.train.merge_test)
             cam2 = merge_subclass_cams_to_parent(cam2, k_list, method=cfg.train.merge_test)
