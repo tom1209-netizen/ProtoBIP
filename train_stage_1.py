@@ -66,7 +66,6 @@ def train(cfg):
     time0 = datetime.datetime.now()
     time0 = time0.replace(microsecond=0)
 
-    # ============ prepare data ============
     print("\nPreparing datasets...")
     train_dataset, val_dataset = get_cls_dataset(cfg, split="valid")
     
@@ -87,7 +86,6 @@ def train(cfg):
                           pin_memory=True,
                           persistent_workers=True)
 
-    # ============ prepare model ============
     model = ClsNetwork(backbone=cfg.model.backbone.config,
                     stride=cfg.model.backbone.stride,
                     cls_num_classes=cfg.dataset.cls_num_classes,
@@ -136,15 +134,13 @@ def train(cfg):
     
     for n_iter in range(cfg.train.max_iters):
         try:
-            # We now need the pixel-wise ground truth `gt_label` for the diversity loss
-            img_name, inputs, cls_labels, gt_label = next(train_loader_iter)
+            img_name, inputs, cls_labels, _ = next(train_loader_iter)
         except StopIteration:
             train_loader_iter = iter(train_loader)
-            img_name, inputs, cls_labels, gt_label = next(train_loader_iter)
+            img_name, inputs, cls_labels, _ = next(train_loader_iter)
 
         inputs = inputs.to(device).float()
         cls_labels = cls_labels.to(device).float()
-        gt_label = gt_label.to(device) # Send ground truth mask to device
         
         with torch.cuda.amp.autocast():
             # Unpack the new return value from the model
@@ -179,18 +175,38 @@ def train(cfg):
                 bg_loss = bg_loss_fn(bg_features, fg_pro, bg_pro)
                 contrastive_loss = fg_loss + bg_loss
 
+            with torch.no_grad(): 
+                # `cam4` has shape [B, Total_Prototypes, H, W]. We merge them to parent classes first.
+                cam4_merged = merge_subclass_cams_to_parent(cam4, k_list, method=cfg.train.merge_train)
+                
+                # Add a background channel. A common heuristic is 1 - max(foreground_cams)
+                cam_max, _ = torch.max(cam4_merged, dim=1, keepdim=True)
+                
+                # A threshold (e.g., 0.2) can be used for the background score.
+                # This prevents the background from dominating when activations are low.
+                background_score = torch.full_like(cam_max, 0.2)
+                
+                # Combine foreground and background activation maps
+                full_cam = torch.cat([background_score, cam4_merged], dim=1) # Shape: [B, Num_Classes + 1, H, W]
+                
+                # The pseudo-mask is the argmax of these activations.
+                # This gives us a pixel-wise class prediction.
+                pseudo_mask = torch.argmax(full_cam, dim=1) # Shape: [B, H, W]
+
             # --- Diversity Loss (L_J) ---
-            # We need to resize the ground truth mask to match the feature map dimensions
-            gt_mask_resized = F.interpolate(gt_label.unsqueeze(1).float(), 
-                                            size=feature_map_for_diversity.shape[2:], 
-                                            mode='nearest').squeeze(1).long()
+            # Resize the pseudo-mask to match the feature map dimensions.
+            # It's already the right size if cam4 and feature_map_for_diversity are from the same layer.
+            # But we resize for safety.
+            pseudo_mask_resized = F.interpolate(pseudo_mask.unsqueeze(1).float(), 
+                                                size=feature_map_for_diversity.shape[2:], 
+                                                mode='nearest').squeeze(1).long()
             
-            diversity_loss = diversity_loss_fn(feature_map_for_diversity, l_fea, gt_mask_resized)
+            # Now, calculate the diversity loss using our generated pseudo-mask
+            diversity_loss = diversity_loss_fn(feature_map_for_diversity, l_fea, pseudo_mask_resized)
 
             # --- Total Loss ---
-            # Total Loss = L_CLS + lambda_sim * L_SIM + lambda_j * L_J
-            lambda_sim = cfg.train.l5 # Weight for contrastive loss
-            lambda_j = cfg.train.lambda_j # Add this to your config file
+            lambda_sim = cfg.train.l5
+            lambda_j = cfg.train.lambda_j
             
             loss = cls_loss + lambda_sim * (contrastive_loss + 0.0005*torch.mean(cam4)) + lambda_j * diversity_loss
 
