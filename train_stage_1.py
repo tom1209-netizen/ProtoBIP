@@ -129,6 +129,8 @@ def train(cfg):
     # Diversity Loss
     diversity_loss_fn = PrototypeDiversityLoss(num_prototypes_per_class=cfg.model.num_prototypes_per_class).to(device)
 
+    best_fuse234_dice = 0.0
+
     print("\nStarting training...")
     train_loader_iter = iter(train_loader)
     
