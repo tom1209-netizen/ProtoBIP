@@ -35,6 +35,7 @@ start_time = datetime.datetime.now()
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", type=str, default=None)
 parser.add_argument("--gpu", type=int, default=0, help="gpu id")
+parser.add_argument("--resume", type=str, default=None, help="path to the checkpoint to resume from")
 args = parser.parse_args()
 
 def cal_eta(time0, cur_iter, total_iter):
@@ -86,6 +87,11 @@ def train(cfg):
                           pin_memory=True,
                           persistent_workers=True)
 
+    iters_per_epoch = len(train_loader)
+    cfg.train.max_iters = cfg.train.epoch * iters_per_epoch
+    cfg.train.eval_iters = iters_per_epoch
+    cfg.scheduler.warmup_iter = cfg.scheduler.warmup_iter * iters_per_epoch
+
     model = ClsNetwork(backbone=cfg.model.backbone.config,
                     stride=cfg.model.backbone.stride,
                     cls_num_classes=cfg.dataset.cls_num_classes,
@@ -94,15 +100,7 @@ def train(cfg):
                     n_ratio=cfg.model.n_ratio,
                     pretrained=cfg.train.pretrained)
     
-    # Mixed precision training setup
-    iters_per_epoch = len(train_loader)
-    cfg.train.max_iters = cfg.train.epoch * iters_per_epoch
-    cfg.train.eval_iters = iters_per_epoch
-    cfg.scheduler.warmup_iter = cfg.scheduler.warmup_iter * iters_per_epoch
-    scaler = torch.cuda.amp.GradScaler()
-    
     model.to(device)
-    model.train()
 
     # Optimizer configuration
     optimizer = PolyWarmupAdamW(
@@ -115,6 +113,52 @@ def train(cfg):
         warmup_ratio=cfg.scheduler.warmup_ratio,
         power=cfg.scheduler.power
     )
+
+    # Resume training if a checkpoint path is provided
+    start_iter = 0
+    
+    best_fuse234_dice = 0.0
+    
+    # Check if a resume path was provided in the command-line arguments
+    if args.resume is not None:
+        if os.path.exists(args.resume):
+            print(f"\nResuming training from checkpoint: {args.resume}")
+            # Load the checkpoint dictionary
+            checkpoint = torch.load(args.resume, map_location=device)
+            
+            # Load model state
+            # Using strict=False is safer as it won't crash if the model architectures
+            # have minor differences (e.g., a new layer was added).
+            model.load_state_dict(checkpoint['model'], strict=False)
+            
+            # Load optimizer state
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                print("Optimizer state loaded successfully.")
+            else:
+                print("WARNING: Optimizer state not found in checkpoint. Starting with a fresh optimizer.")
+
+            # Load the iteration number to continue from where we left off
+            if 'iter' in checkpoint:
+                start_iter = checkpoint['iter'] + 1 # Start from the next iteration
+                print(f"Resuming from iteration: {start_iter}")
+            else:
+                print("WARNING: Iteration number not found in checkpoint. Starting from iteration 0.")
+            
+            if 'best_mIoU' in checkpoint:
+                 best_fuse234_dice = checkpoint['best_mIoU']
+                 print(f"Loaded previous best mIoU: {best_fuse234_dice:.4f}")
+
+        else:
+            print(f"WARNING: Checkpoint file not found at {args.resume}. Starting from scratch.")
+    else:
+        print("\nStarting training from scratch.")
+    
+    # Mixed precision training setup
+    scaler = torch.cuda.amp.GradScaler()
+    
+    model.to(device)
+    model.train()
 
     # Loss functions and feature extractor setup
     # Classification Loss
@@ -129,12 +173,10 @@ def train(cfg):
     # Diversity Loss
     diversity_loss_fn = PrototypeDiversityLoss(num_prototypes_per_class=cfg.model.num_prototypes_per_class).to(device)
 
-    best_fuse234_dice = 0.0
-
     print("\nStarting training...")
     train_loader_iter = iter(train_loader)
-    
-    for n_iter in range(cfg.train.max_iters):
+
+    for n_iter in range(start_iter, cfg.train.max_iters):
         try:
             img_name, inputs, cls_labels, _ = next(train_loader_iter)
         except StopIteration:
@@ -161,59 +203,47 @@ def train(cfg):
             loss4 = loss_function(cls4_merge, cls_labels)
             cls_loss = cfg.train.l1 * loss1 + cfg.train.l2 * loss2 + cfg.train.l3 * loss3 + cfg.train.l4 * loss4
 
-            # --- Contrastive Loss (L_SIM) ---
-            subclass_labels = expand_parent_to_subclass_labels(cls_labels, k_list)
-            cls4_expand=expand_parent_to_subclass_labels(cls4_merge, k_list)
-            cls4_bir=(cls4>cls4_expand).float()*subclass_labels
-
-            batch_info = feature_extractor.process_batch(inputs, cam4, cls4_bir, clip_model)
-            
-            contrastive_loss = torch.tensor(0.0, device=device)
-            if batch_info is not None:
-                fg_features, bg_features = batch_info['fg_features'], batch_info['bg_features']
-                set_info = pair_features(fg_features, bg_features, l_fea, cls4_bir)
-                fg_features, bg_features, fg_pro, bg_pro = set_info['fg_features'], set_info['bg_features'], set_info['fg_text'], set_info['bg_text']
-                fg_loss = fg_loss_fn(fg_features, fg_pro, bg_pro)
-                bg_loss = bg_loss_fn(bg_features, fg_pro, bg_pro)
-                contrastive_loss = fg_loss + bg_loss
-
-            with torch.no_grad(): 
-                # `cam4` has shape [B, Total_Prototypes, H, W]. We merge them to parent classes first.
-                cam4_merged = merge_subclass_cams_to_parent(cam4, k_list, method=cfg.train.merge_train)
+            # --- Conditional application of other losses based on warm-up ---
+            if n_iter >= cfg.train.warmup_iters:
+                subclass_labels = expand_parent_to_subclass_labels(cls_labels, k_list)
+                cls4_expand = expand_parent_to_subclass_labels(cls4_merge, k_list)
+                cls4_bir = (cls4 > cls4_expand).float() * subclass_labels
+                batch_info = feature_extractor.process_batch(inputs, cam4, cls4_bir, clip_model)
                 
-                # Add a background channel. A common heuristic is 1 - max(foreground_cams)
-                cam_max, _ = torch.max(cam4_merged, dim=1, keepdim=True)
-                
-                # A threshold (e.g., 0.2) can be used for the background score.
-                # This prevents the background from dominating when activations are low.
-                background_score = torch.full_like(cam_max, 0.2)
-                
-                # Combine foreground and background activation maps
-                full_cam = torch.cat([background_score, cam4_merged], dim=1) # Shape: [B, Num_Classes + 1, H, W]
-                
-                # The pseudo-mask is the argmax of these activations.
-                # This gives us a pixel-wise class prediction.
-                pseudo_mask = torch.argmax(full_cam, dim=1) # Shape: [B, H, W]
+                contrastive_loss = None
+                if batch_info is not None:
+                    fg_features, bg_features = batch_info['fg_features'], batch_info['bg_features']
+                    set_info = pair_features(fg_features, bg_features, l_fea, cls4_bir)
+                    fg_features, bg_features, fg_pro, bg_pro = set_info['fg_features'], set_info['bg_features'], set_info['fg_text'], set_info['bg_text']
+                    fg_loss = fg_loss_fn(fg_features, fg_pro, bg_pro)
+                    bg_loss = bg_loss_fn(bg_features, fg_pro, bg_pro)
+                    contrastive_loss = fg_loss + bg_loss
 
-            # --- Diversity Loss (L_J) ---
-            # Resize the pseudo-mask to match the feature map dimensions.
-            # It's already the right size if cam4 and feature_map_for_diversity are from the same layer.
-            # But we resize for safety.
-            pseudo_mask_resized = F.interpolate(pseudo_mask.unsqueeze(1).float(), 
-                                                size=feature_map_for_diversity.shape[2:], 
-                                                mode='nearest').squeeze(1).long()
-            
-            # Now, calculate the diversity loss using our generated pseudo-mask
-            diversity_loss = diversity_loss_fn(feature_map_for_diversity, l_fea, pseudo_mask_resized)
+                with torch.no_grad(): 
+                    cam4_merged = merge_subclass_cams_to_parent(cam4, k_list, method=cfg.train.merge_train)
+                    cam_max, _ = torch.max(cam4_merged, dim=1, keepdim=True)
+                    background_score = torch.full_like(cam_max, 0.2)
+                    full_cam = torch.cat([background_score, cam4_merged], dim=1)
+                    pseudo_mask = torch.argmax(full_cam, dim=1)
 
-            # --- Total Loss ---
-            lambda_sim = cfg.train.l5
-            lambda_j = cfg.train.lambda_j
-            
-            loss = cls_loss + lambda_sim * (contrastive_loss + 0.0005*torch.mean(cam4)) + lambda_j * diversity_loss
+                pseudo_mask_resized = F.interpolate(pseudo_mask.unsqueeze(1).float(), size=feature_map_for_diversity.shape[2:], mode='nearest').squeeze(1).long()
+                diversity_loss = diversity_loss_fn(feature_map_for_diversity, l_fea, pseudo_mask_resized)
 
-        # Gradient scaling for mixed precision
-        optimizer.zero_grad(set_to_none=True)  # More efficient gradient clearing 5358
+                # Total Loss = All components
+                lambda_sim = cfg.train.l5
+                lambda_j = cfg.train.lambda_j
+                loss = cls_loss + lambda_j * diversity_loss
+                if contrastive_loss is not None:
+                    loss = loss + lambda_sim * (contrastive_loss + 0.0005 * torch.mean(cam4))
+            else:
+                # --- WARM-UP PHASE ---
+                loss = cls_loss
+
+        # A one-time message to signal the end of the warm-up period
+        if n_iter == cfg.train.warmup_iters:
+            print(f"\n--- Iteration {n_iter}: Warm-up complete. Activating contrastive and diversity losses. ---\n")
+
+        optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -247,18 +277,20 @@ def train(cfg):
             print(f"Val all acc4: {val_all_acc4:.6f}")
             print(f"Val avg acc4: {val_avg_acc4:.6f}")
             print(f"Fuse234 score: {fuse234_score}, mIOU: {fuse234_score[:-1].mean():.4f}")
+
+            current_miou = fuse234_score[:-1].mean().item()
             
-            if fuse234_score[:-1].mean() > best_fuse234_dice:
-                best_fuse234_dice = fuse234_score[:-1].mean()
+            if current_miou > best_fuse234_dice:
+                best_fuse234_dice = current_miou
                 save_path = os.path.join(cfg.work_dir.ckpt_dir, "best_cam.pth")
                 
-                # Save best model checkpoint
                 torch.save(
                     {
                         "cfg": cfg,
                         "iter": n_iter,
                         "model": model.state_dict(),
-                        "optimizer": optimizer.state_dict()
+                        "optimizer": optimizer.state_dict(),
+                        "best_mIoU": best_fuse234_dice 
                     },
                     save_path,
                     _use_new_zipfile_serialization=True

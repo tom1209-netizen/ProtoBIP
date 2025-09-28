@@ -25,6 +25,7 @@ work_dir:
 train:
   samples_per_gpu: 10
   epoch: 8
+  warmup_iters: 4000
   pretrained: true
   l1: 0.0
   l2: 0.1
