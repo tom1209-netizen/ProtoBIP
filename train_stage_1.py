@@ -276,26 +276,34 @@ def train(cfg):
             print("Validation results:")
             print(f"Val all acc4: {val_all_acc4:.6f}")
             print(f"Val avg acc4: {val_avg_acc4:.6f}")
-            print(f"Fuse234 score: {fuse234_score}, mIOU: {fuse234_score[:-1].mean():.4f}")
 
             current_miou = fuse234_score[:-1].mean().item()
+            print(f"Fuse234 score: {fuse234_score}, mIOU: {current_miou:.4f}")
             
-            if current_miou > best_fuse234_dice:
-                best_fuse234_dice = current_miou
-                save_path = os.path.join(cfg.work_dir.ckpt_dir, "best_cam.pth")
-                
-                torch.save(
-                    {
-                        "cfg": cfg,
-                        "iter": n_iter,
-                        "model": model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "best_mIoU": best_fuse234_dice 
-                    },
-                    save_path,
-                    _use_new_zipfile_serialization=True
-                )
-                print(f"\nSaved best model with mIOU: {best_fuse234_dice:.4f}")
+            # Define a grace period, one epoch
+            saving_grace_period = cfg.train.eval_iters
+
+            # Only consider saving if we are past the warm-up + grace period.
+            if (n_iter + 1) > (cfg.train.warmup_iters + saving_grace_period):
+                if current_miou > best_fuse234_dice:
+                    best_fuse234_dice = current_miou
+                    save_path = os.path.join(cfg.work_dir.ckpt_dir, "best_cam.pth")
+                    
+                    torch.save(
+                        {
+                            "cfg": cfg,
+                            "iter": n_iter,
+                            "model": model.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "best_mIoU": best_fuse234_dice 
+                        },
+                        save_path,
+                        _use_new_zipfile_serialization=True
+                    )
+                    print(f"\nSaved best model with mIOU: {best_fuse234_dice:.4f}")
+            else:
+                # If we are in the grace period, print a message but don't save.
+                print(f"--- In warm-up or grace period (current iter: {n_iter + 1}). Skipping best model check. ---")
 
     torch.cuda.empty_cache()
     end_time = datetime.datetime.now()
