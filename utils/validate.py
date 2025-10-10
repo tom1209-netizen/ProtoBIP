@@ -12,6 +12,7 @@ from tqdm import tqdm
 from PIL import Image
 from torch.utils.data import DataLoader
 
+from .crf import DenseCRF
 from .evaluate import ConfusionMatrixAllClass
 from .hierarchical_utils import merge_to_parent_predictions, merge_subclass_cams_to_parent
 from .pyutils import AverageMeter
@@ -132,8 +133,16 @@ def validate(model=None, data_loader=None, cfg=None, cls_loss_func=None):
 
 
 def generate_cam(model=None, data_loader=None, cfg=None, cls_loss_func=None):
-
     model.eval()
+
+    ## Instantiate the CRF processor
+    crf_processor = DenseCRF()
+
+    ## Get MEAN/STD for de-normalization
+    MEAN = [0.66791496, 0.47791372, 0.70623304] # Mean values for normalization, specific to the dataset
+    STD = [0.1736589,  0.22564577, 0.19820057] # Standard deviation values.
+    std = torch.tensor(STD, device='cuda').view(1, 3, 1, 1)
+    mean = torch.tensor(MEAN, device='cuda').view(1, 3, 1, 1)
 
     with torch.no_grad():
         for data in tqdm(data_loader,
@@ -158,21 +167,49 @@ def generate_cam(model=None, data_loader=None, cfg=None, cls_loss_func=None):
             cam4 = get_seg_label(cam4, inputs, cls_label).cuda()
 
             fuse234 = 0.3 * cam2 + 0.3 * cam3 + 0.4 * cam4
-            output_fuse234 = torch.argmax(fuse234, dim=1).long()
+            
+            # This is the original, blobby prediction. We will replace this.
+            # output_fuse234 = torch.argmax(fuse234, dim=1).long()
 
+            ## Prepare inputs for the CRF
+            # The CRF needs a probability map, so we apply softmax to the fused CAMs.
+            # We add a background channel as the CRF expects probabilities for all classes including background.
+            cam_max = torch.max(fuse234, dim=1, keepdim=True)[0]
+            bg_cam = (1 - cam_max) ** 10 # Using your background estimation method
+            full_probs_tensor = torch.cat([bg_cam, fuse234], dim=1) # Note: The paper uses 5 classes (4 + background)
+            
+            # The order of classes for CRF should be [BG, TUM, STR, LYM, NEC]
+            # Ensure your palette and class order match this.
+            # Let's adjust for the number of classes in your config (4 classes + 1 background = 5)
+            # Add a dummy channel for the actual background class to make it 5 channels for softmax
+            num_actual_classes = cfg.dataset.cls_num_classes + 1
+            full_probs_tensor = F.softmax(full_probs_tensor, dim=1)
+            probs_np = full_probs_tensor.cpu().numpy() # Shape: [B, 5, H, W]
+
+            # De-normalize the input image for the CRF's bilateral filter
+            img_denorm_tensor = (inputs * std) + mean
+            img_denorm_tensor = torch.clamp(img_denorm_tensor * 255, 0, 255).byte()
+            img_np = img_denorm_tensor.permute(0, 2, 3, 1).cpu().numpy() # Shape: [B, H, W, C]
+
+            ## CRF Step 4: Apply the CRF
+            refined_mask, _ = crf_processor.process(probs=probs_np, images=img_np)
+            # The output `refined_mask` is a numpy array of shape [B, H, W] with integer class labels.
+
+            # Convert the refined mask back to a tensor for saving logic
+            output_refined = torch.from_numpy(refined_mask).long()
 
             PALETTE = [
-             [255, 0, 0] ,   
-             [0, 255, 0],     
-             [0,0,255],  
-             [153, 0, 255],   
-             [255, 255, 255],
-             [0, 0, 0],]     
+                [255, 0, 0] ,   # TUM
+                [0, 255, 0],   # STR
+                [0, 0, 255],   # LYM
+                [153, 0, 255], # NEC
+                [0, 0, 0],     # BACK - Assuming background is class 4 now
+            ]
 
-            for i in range(len(output_fuse234)):
-                pred_mask = Image.fromarray(output_fuse234[i].cpu().clone().squeeze().numpy().astype(np.uint8)).convert('P')
+            for i in range(len(output_refined)):
+                pred_mask = Image.fromarray(output_refined[i].cpu().squeeze().numpy().astype(np.uint8)).convert('P')
                 flat_palette = [val for sublist in PALETTE for val in sublist]
                 pred_mask.putpalette(flat_palette)
-                pred_mask.save(os.path.join(cfg.work_dir.pred_dir, name[i] + ".png"))
+                pred_mask.save(os.path.join(cfg.work_dir.pred_dir, name[i])) 
     model.train()
-    return 
+    return
