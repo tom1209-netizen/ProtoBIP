@@ -44,16 +44,22 @@ def get_seg_label(cams, inputs, label):
 
 
 def validate(model=None, data_loader=None, cfg=None, cls_loss_func=None):
-    """Validation function with test-time augmentation"""
+    """Validation function with test-time augmentation AND CRF post-processing."""
     model.eval()
     avg_meter = AverageMeter()
     fuse234_matrix = ConfusionMatrixAllClass(num_classes=cfg.dataset.cls_num_classes + 1)
+
+    crf_processor = DenseCRF()
+    MEAN = [0.66791496, 0.47791372, 0.70623304] # Mean values for normalization, specific to the dataset
+    STD = [0.1736589,  0.22564577, 0.19820057] # Standard deviation values.
+    std_tensor = torch.tensor(STD, device='cuda').view(1, 3, 1, 1)
+    mean_tensor = torch.tensor(MEAN, device='cuda').view(1, 3, 1, 1)
     
-    # Test-time augmentation setup
     tta_transform = tta.Compose([
         tta.HorizontalFlip(),
         tta.Multiply(factors=[0.9, 1.0, 1.1])
     ])
+
     with torch.no_grad():
         for data in tqdm(data_loader,
                          total=len(data_loader), ncols=100, ascii=" >="):
@@ -63,70 +69,63 @@ def validate(model=None, data_loader=None, cfg=None, cls_loss_func=None):
             labels = labels.cuda()
             cls_label = cls_label.cuda().float()
 
-            (cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, 
-             l_fea, k_list, _) = model(inputs)
-
+            (cls1, _, _, _, _, _, cls4, _, _, k_list, _) = model(inputs)
             cls1 = merge_to_parent_predictions(cls1, k_list, method=cfg.train.merge_test)
-            cls2 = merge_to_parent_predictions(cls2, k_list, method=cfg.train.merge_test)
-            cls3 = merge_to_parent_predictions(cls3, k_list, method=cfg.train.merge_test)
             cls4 = merge_to_parent_predictions(cls4, k_list, method=cfg.train.merge_test)
-
-            cls_loss1 = cls_loss_func(cls1, cls_label)
-            cls_loss2 = cls_loss_func(cls2, cls_label)
-            cls_loss3 = cls_loss_func(cls3, cls_label)
-            cls_loss4 = cls_loss_func(cls4, cls_label)
-            cls_loss = cfg.train.l1 * cls_loss1 + cfg.train.l2 * cls_loss2 + cfg.train.l3 * cls_loss3 + cfg.train.l4 * cls_loss4
-
-            cls4 = (torch.sigmoid(cls4) > 0.5).float()
-            all_cls_acc4 = (cls4 == cls_label).all(dim=1).float().sum() / cls4.shape[0] * 100
-            avg_cls_acc4 = ((cls4 == cls_label).sum(dim=0) / cls4.shape[0]).mean() * 100
+            cls_loss = cls_loss_func(cls1, cls_label)
+            cls4_acc_check = (torch.sigmoid(cls4) > 0.5).float()
+            all_cls_acc4 = (cls4_acc_check == cls_label).all(dim=1).float().sum() / cls4_acc_check.shape[0] * 100
+            avg_cls_acc4 = ((cls4_acc_check == cls_label).sum(dim=0) / cls4_acc_check.shape[0]).mean() * 100
             avg_meter.add({"all_cls_acc4": all_cls_acc4, "avg_cls_acc4": avg_cls_acc4, "cls_loss": cls_loss})
             
-            # Generate evaluation CAMs with TTA
-            cams1 = []
             cams2 = []
             cams3 = []
             cams4 = []
             for tta_trans in tta_transform:
                 augmented_tensor = tta_trans.augment_image(inputs)
-                (cls1, cam1, cls2, cam2, cls3, cam3, cls4, cam4, l_fea, k_list, _) = model(augmented_tensor)
+                (_, _, _, cam2, _, cam3, _, cam4, _, k_list, _) = model(augmented_tensor)
 
-                cam1 = merge_subclass_cams_to_parent(cam1, k_list, method=cfg.train.merge_test)
                 cam2 = merge_subclass_cams_to_parent(cam2, k_list, method=cfg.train.merge_test)
                 cam3 = merge_subclass_cams_to_parent(cam3, k_list, method=cfg.train.merge_test)
                 cam4 = merge_subclass_cams_to_parent(cam4, k_list, method=cfg.train.merge_test)
 
-                cls1 = merge_to_parent_predictions(cls1, k_list, method=cfg.train.merge_test)
-                cls2 = merge_to_parent_predictions(cls2, k_list, method=cfg.train.merge_test)
-                cls3 = merge_to_parent_predictions(cls3, k_list, method=cfg.train.merge_test)
-                cls4 = merge_to_parent_predictions(cls4, k_list, method=cfg.train.merge_test)
-
-                cam1 = get_seg_label(cam1, augmented_tensor, cls_label).cuda()
-                cam1 = tta_trans.deaugment_mask(cam1).unsqueeze(dim=0)
-                cams1.append(cam1)
                 cam2 = get_seg_label(cam2, augmented_tensor, cls_label).cuda()
                 cam2 = tta_trans.deaugment_mask(cam2).unsqueeze(dim=0)
                 cams2.append(cam2)
+                
                 cam3 = get_seg_label(cam3, augmented_tensor, cls_label).cuda()
                 cam3 = tta_trans.deaugment_mask(cam3).unsqueeze(dim=0)
                 cams3.append(cam3)
+
                 cam4 = get_seg_label(cam4, augmented_tensor, cls_label).cuda()
                 cam4 = tta_trans.deaugment_mask(cam4).unsqueeze(dim=0)
                 cams4.append(cam4)
 
-            cams1 = torch.cat(cams1, dim=0).mean(dim=0)
             cams2 = torch.cat(cams2, dim=0).mean(dim=0)
             cams3 = torch.cat(cams3, dim=0).mean(dim=0)
             cams4 = torch.cat(cams4, dim=0).mean(dim=0)
 
-            # Fuse multi-scale predictions
             fuse234 = 0.3 * cams2 + 0.3 * cams3 + 0.4 * cams4
-            fuse_label234 = torch.argmax(fuse234, dim=1).cuda()
+
+            cam_max = torch.max(fuse234, dim=1, keepdim=True)[0]
+            bg_cam = (1 - cam_max) ** 10
+            
+            full_probs_tensor = torch.cat([fuse234, bg_cam], dim=1)
+            
+            full_probs_tensor = F.softmax(full_probs_tensor, dim=1)
+            probs_np = full_probs_tensor.cpu().numpy()
+
+            img_denorm_tensor = (inputs * std_tensor) + mean_tensor
+            img_denorm_tensor = torch.clamp(img_denorm_tensor * 255, 0, 255).byte()
+            img_np = img_denorm_tensor.permute(0, 2, 3, 1).cpu().numpy()
+
+            refined_mask, _ = crf_processor.process(probs=probs_np, images=img_np)
+            
+            fuse_label234 = torch.from_numpy(refined_mask).long().cuda()
             
             fuse234_matrix.update(labels.detach().clone(), fuse_label234.clone())
 
-    all_cls_acc4, avg_cls_acc4, cls_loss = avg_meter.pop('all_cls_acc4'), avg_meter.pop("avg_cls_acc4"), avg_meter.pop(
-        "cls_loss")
+    all_cls_acc4, avg_cls_acc4, cls_loss = avg_meter.pop('all_cls_acc4'), avg_meter.pop("avg_cls_acc4"), avg_meter.pop("cls_loss")
     fuse234_score = fuse234_matrix.compute()[2]
     model.train()
     return all_cls_acc4, avg_cls_acc4, fuse234_score, cls_loss
@@ -176,12 +175,8 @@ def generate_cam(model=None, data_loader=None, cfg=None, cls_loss_func=None):
             # We add a background channel as the CRF expects probabilities for all classes including background.
             cam_max = torch.max(fuse234, dim=1, keepdim=True)[0]
             bg_cam = (1 - cam_max) ** 10 # Using your background estimation method
-            full_probs_tensor = torch.cat([bg_cam, fuse234], dim=1) # Note: The paper uses 5 classes (4 + background)
+            full_probs_tensor = torch.cat([fuse234, bg_cam], dim=1) # Note: The paper uses 5 classes (4 + background)
             
-            # The order of classes for CRF should be [BG, TUM, STR, LYM, NEC]
-            # Ensure your palette and class order match this.
-            # Let's adjust for the number of classes in your config (4 classes + 1 background = 5)
-            # Add a dummy channel for the actual background class to make it 5 channels for softmax
             num_actual_classes = cfg.dataset.cls_num_classes + 1
             full_probs_tensor = F.softmax(full_probs_tensor, dim=1)
             probs_np = full_probs_tensor.cpu().numpy() # Shape: [B, 5, H, W]

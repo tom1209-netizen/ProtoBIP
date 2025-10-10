@@ -52,6 +52,11 @@ class DenseCRF:
         size = images.shape[1:3]
         crf = np.zeros((num_input_images, num_classes, size[0], size[1]))
         for iter_input_image in range(num_input_images):
+            # Get the current image slice from the batch
+            image_slice = images[iter_input_image]
+            # Ensure the image is C-contiguous in memory before passing it to the CRF
+            contiguous_image = np.ascontiguousarray(image_slice, dtype=np.uint8)
+            
             pass_class_inds = np.where(np.sum(np.sum(probs[iter_input_image], axis=1), axis=1) > 0)
             # Set up dense CRF 2D
             d = dcrf.DenseCRF2D(size[1], size[0], len(pass_class_inds[0]))
@@ -65,7 +70,8 @@ class DenseCRF:
             # Incorporate local colour-dependent features
             # (sxy are Bi_X_Std and Bi_Y_Std,
             #  srgb are Bi_R_Std, Bi_G_Std, Bi_B_Std)
-            d.addPairwiseBilateral(sxy=self.bilat_sxy, srgb=self.bilat_srgb, rgbim=np.uint8(images[iter_input_image]),
+
+            d.addPairwiseBilateral(sxy=self.bilat_sxy, srgb=self.bilat_srgb, rgbim=contiguous_image,
                                    compat=self.bilat_compat)
             # Do inference
             Q = d.inference(self.n_infer)

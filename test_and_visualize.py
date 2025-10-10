@@ -20,7 +20,7 @@ def main():
     cfg = OmegaConf.load(args.config)
 
     # --- Setup ---
-    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "mps")
     print(f"Using device: {device}")
     set_seed(42)
 
