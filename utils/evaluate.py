@@ -45,9 +45,10 @@ class ConfusionMatrixAllClass(object):
         acc = torch.diag(h) / h.sum(1)
         iu = torch.diag(h) / (h.sum(1) + h.sum(0) - torch.diag(h))
         dice = 2 * torch.diag(h) / (h.sum(1) + h.sum(0))
+        fw_iu = ( (h.sum(1) / h.sum()) * iu ).sum()
         h_bg_fg = self.mat2.float()
         dice_bg_fg = 2 * torch.diag(h_bg_fg) / (h_bg_fg.sum(1) + h_bg_fg.sum(0))
-        return acc_global, acc, iu, dice, dice_bg_fg
+        return acc_global, acc, iu, dice, dice_bg_fg, fw_iu
 
     def reduce_from_all_processes(self):
         if not torch.distributed.is_available():

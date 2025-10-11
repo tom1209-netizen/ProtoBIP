@@ -126,9 +126,16 @@ def validate(model=None, data_loader=None, cfg=None, cls_loss_func=None):
             fuse234_matrix.update(labels.detach().clone(), fuse_label234.clone())
 
     all_cls_acc4, avg_cls_acc4, cls_loss = avg_meter.pop('all_cls_acc4'), avg_meter.pop("avg_cls_acc4"), avg_meter.pop("cls_loss")
+
+    _, _, iu_per_class, dice_per_class, _, fw_iu = fuse234_matrix.compute()
+
+    mIoU = iu_per_class[:-1].mean().item() * 100
+    mean_dice = dice_per_class[:-1].mean().item() * 100
+    fw_iu = fw_iu.item() * 100
     fuse234_score = fuse234_matrix.compute()[2]
+    
     model.train()
-    return all_cls_acc4, avg_cls_acc4, fuse234_score, cls_loss
+    return mIoU, mean_dice, fw_iu, iu_per_class, dice_per_class
 
 
 def generate_cam(model=None, data_loader=None, cfg=None, cls_loss_func=None):
