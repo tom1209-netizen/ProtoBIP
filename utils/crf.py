@@ -10,7 +10,7 @@ class DenseCRF:
     """Class for implementing a dense CRF"""
 
     def __init__(self):
-        self.gauss_sxy = 3
+        self.gauss_sxy = 15
         self.gauss_compat = 30
         self.bilat_sxy = 10
         self.bilat_srgb = 20

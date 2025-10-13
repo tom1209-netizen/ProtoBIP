@@ -133,7 +133,7 @@ def validate(model=None, data_loader=None, cfg=None, cls_loss_func=None):
     mean_dice = dice_per_class[:-1].mean().item() * 100
     fw_iu = fw_iu.item() * 100
     fuse234_score = fuse234_matrix.compute()[2]
-    
+
     model.train()
     return mIoU, mean_dice, fw_iu, iu_per_class, dice_per_class
 
@@ -205,7 +205,7 @@ def generate_cam(model=None, data_loader=None, cfg=None, cls_loss_func=None):
                 [0, 255, 0],   # STR
                 [0, 0, 255],   # LYM
                 [153, 0, 255], # NEC
-                [0, 0, 0],     # BACK - Assuming background is class 4 now
+                [255, 255, 255],     # BACK - Assuming background is class 4 now
             ]
 
             for i in range(len(output_refined)):

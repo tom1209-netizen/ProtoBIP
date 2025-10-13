@@ -69,13 +69,28 @@ def main():
     # --- Optional: Re-run Evaluation to Confirm Score ---
     print("\n1. Re-running evaluation on test dataset...")
     print("-" * 50)
-    loss_function = nn.BCEWithLogitsLoss().to(device) # Needed for validate function
-    test_all_acc4, test_avg_acc4, fuse234_score, test_cls_loss = validate(
+    loss_function = nn.BCEWithLogitsLoss().to(device) 
+
+    mIoU, mean_dice, fw_iu, iou_per_class, dice_per_class = validate(
         model=model, data_loader=test_loader, cfg=cfg, cls_loss_func=loss_function
     )
-    print("Evaluation results:")
-    print(f"Test avg acc4: {test_avg_acc4:.4f}")
-    print(f"Test mIOU: {fuse234_score[:-1].mean():.4f}")
+    
+    class_names = test_dataset.CLASSES[:-1] 
+
+    # Print the detailed results
+    print("\n" + "="*24 + " FINAL TEST RESULTS " + "="*24)
+    print(f"📈 Mean IoU (mIoU): {mIoU:.4f}%")
+    print(f"🎲 Mean Dice:      {mean_dice:.4f}%")
+    print(f"📊 FreqW IoU:      {fw_iu:.4f}%")
+    print("-" * 68)
+    print("Per-Class Scores:")
+    print(f"{'Class':<12} | {'IoU':<10} | {'Dice':<10}")
+    print("-" * 38)
+    for i, name in enumerate(class_names):
+        iou = iou_per_class[i].item() * 100
+        dice = dice_per_class[i].item() * 100
+        print(f"{name:<12} | {iou:<10.4f} | {dice:<10.4f}")
+    print("="*68 + "\n")
 
     # --- Generate CAMs for Visualization ---
     print("\n2. Generating CAMs for visualization...")
