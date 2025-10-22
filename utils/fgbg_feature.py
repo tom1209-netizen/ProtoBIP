@@ -56,7 +56,6 @@ class FeatureExtractor:
                            mode="bilinear", align_corners=True)
         
     # Implements the element-wise multiplication from Equation 5
-    @torch.cuda.amp.autocast()
     def extract_features(self, img_224, cam_224, cam_224_mask, label):
         batch_indices, class_indices = torch.where(label == 1)
         
@@ -79,25 +78,14 @@ class FeatureExtractor:
         return fg_features, bg_features, fg_masks, bg_masks
         
     # Extracts features from the masked images
-    @torch.cuda.amp.autocast()
     def get_masked_features(self, fg_features, bg_features, fg_masks, bg_masks, clip_model):
-        # Normalizes features to [0, 1] range for stability
-        fg_min = fg_features.amin(dim=(2, 3), keepdim=True)
-        fg_max = fg_features.amax(dim=(2, 3), keepdim=True)
-        normalized_fg_features = (fg_features - fg_min) / (fg_max - fg_min + 1e-8)
-        
-        bg_min = bg_features.amin(dim=(2, 3), keepdim=True)
-        bg_max = bg_features.amax(dim=(2, 3), keepdim=True)
-        normalized_bg_features = (bg_features - bg_min) / (bg_max - bg_min + 1e-8)
-        
         # Gets the feature vector for the foreground region and background region
-        fg_img_features = clip_model.vision_model(normalized_fg_features*fg_masks)
-        bg_img_features = clip_model.vision_model(normalized_bg_features*bg_masks)
+        fg_img_features = clip_model.vision_model(fg_features * fg_masks)
+        bg_img_features = clip_model.vision_model(bg_features * bg_masks)
             
         return fg_img_features, bg_img_features
 
     # The main function that orchestrates the whole process for a batch
-    @torch.cuda.amp.autocast()
     def process_batch(self, inputs, cam, label, clip_model):
         if not torch.any(label == 1):
             return None

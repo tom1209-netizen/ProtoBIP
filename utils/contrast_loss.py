@@ -10,37 +10,27 @@ class InfoNCELossFG(nn.Module):
         print(f'Use InfoNCELossFG with temperature: {temperature}')
 
     def forward(self, fg_img_feature, fg_pro_feature, bg_pro_feature):
-        # These will accumulate sums for the numerator and denominator of the loss
-        positive_sims = torch.tensor(0., requires_grad=True, device=fg_img_feature.device)
-        negative_sims = torch.tensor(0., requires_grad=True, device=fg_img_feature.device)
-
         # Normalize image features
-        fg_img_feature = fg_img_feature / fg_img_feature.norm(dim=-1, keepdim=True)  # [N, D]
+        fg_img_feature_norm = F.normalize(fg_img_feature, p=2, dim=-1) # [N, D]
         
-        batch_size = fg_img_feature.shape[0]
-        for i in range(batch_size):
-            # The feature vector for the current foreground region
-            curr_fg_img = fg_img_feature[i:i+1]  # [1, D]
-            # The "positive" prototype for this region
-            curr_fg_pro = fg_pro_feature[i:i+1]  # [1, D]
-            # The "negative" prototypes (from other classes)
-            curr_bg_pro = bg_pro_feature[i]  # [L, D]
-            
-            # Similarity between the image feature and the positive prototype
-            fg_img_fg_pro_logits = curr_fg_img @ curr_fg_pro.t()  # [1, 1]
-            # Similarity between the image feature and the negative prototypes
-            fg_img_bg_pro_logits = curr_fg_img @ curr_bg_pro.t()  # [1, L]
-            
-            # Numerator of Equation 9: exp(similarity(positive) / τ)
-            positive_sims = positive_sims + torch.exp(fg_img_fg_pro_logits / self.temperature).sum()
-            
-            # Denominator of Equation 9: exp(similarity(positive)) + Σ exp(similarity(negative))
-            negative_sims = negative_sims + \
-                           torch.exp(fg_img_fg_pro_logits / self.temperature).sum() + \
-                           torch.exp(fg_img_bg_pro_logits / self.temperature).sum()
+        # Calculate positive similarities
+        # [N, D] * [N, D] -> sum(dim=1) -> [N]
+        pos_sim = torch.sum(fg_img_feature_norm * fg_pro_feature, dim=1) # [N]
+
+        # Calculate negative similarities
+        # [N, D] @ [N, D, L] -> [N, L] (using einsum for batched matmul)
+        neg_sim = torch.einsum('nd,nld->nl', fg_img_feature_norm, bg_pro_feature) # [N, L]
+
+        # Apply temperature
+        pos_sim_exp = torch.exp(pos_sim / self.temperature) # [N]
+        neg_sim_exp = torch.exp(neg_sim / self.temperature) # [N, L]
+
+        # Sum numerators and denominators
+        positive_sum = torch.sum(pos_sim_exp)
+        negative_sum = positive_sum + torch.sum(neg_sim_exp)
             
         # The final loss is -log(numerator / denominator)
-        loss = -torch.log(positive_sims / negative_sims)
+        loss = -torch.log(positive_sum / negative_sum)
 
         return loss
 
@@ -52,26 +42,25 @@ class InfoNCELossBG(nn.Module):
         print(f'Use InfoNCELossBG with temperature: {temperature}')
 
     def forward(self, bg_img_feature, fg_pro_feature, bg_pro_feature):
-        positive_sims = torch.tensor(0., requires_grad=True, device=bg_img_feature.device)
-        negative_sims = torch.tensor(0., requires_grad=True, device=bg_img_feature.device)
-
-        bg_img_feature = bg_img_feature / bg_img_feature.norm(dim=-1, keepdim=True)  # [N, D]
+        # Normalize image features
+        bg_img_feature_norm = F.normalize(bg_img_feature, p=2, dim=-1) # [N, D]
         
-        batch_size = bg_img_feature.shape[0]
-        for i in range(batch_size):
-            curr_bg_img = bg_img_feature[i:i+1]  # [1, D]
-            curr_fg_pro = fg_pro_feature[i:i+1]  # [1, D]
-            curr_bg_pro = bg_pro_feature[i]  # [L, D]
+        # Calculate positive similarities (BG img vs BG text)
+        # [N, D] @ [N, D, L] -> [N, L] (using einsum)
+        pos_sim = torch.einsum('nd,nld->nl', bg_img_feature_norm, bg_pro_feature) # [N, L]
+        
+        # Calculate negative similarities (BG img vs FG text)
+        # [N, D] * [N, D] -> sum(dim=1) -> [N]
+        neg_sim = torch.sum(bg_img_feature_norm * fg_pro_feature, dim=1) # [N]
+        
+        # Apply temperature
+        pos_sim_exp = torch.exp(pos_sim / self.temperature) # [N, L]
+        neg_sim_exp = torch.exp(neg_sim / self.temperature) # [N]
 
-            bg_img_bg_pro_logits = curr_bg_img @ curr_bg_pro.t()  # [1, L]
-            bg_img_fg_pro_logits = curr_bg_img @ curr_fg_pro.t()  # [1, 1]
+        # Sum numerators and denominators
+        positive_sum = torch.mean(pos_sim_exp, dim=1).sum()
+        negative_sum = positive_sum + torch.sum(neg_sim_exp)
 
-            positive_sims = positive_sims + torch.exp(bg_img_bg_pro_logits / self.temperature).mean()
-
-            negative_sims = negative_sims + \
-                           torch.exp(bg_img_bg_pro_logits / self.temperature).mean() + \
-                           torch.exp(bg_img_fg_pro_logits / self.temperature).sum()
-
-        loss = -torch.log(positive_sims / negative_sims)
+        loss = -torch.log(positive_sum / negative_sum)
 
         return loss

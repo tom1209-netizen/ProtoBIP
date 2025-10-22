@@ -267,19 +267,22 @@ def train(cfg):
             )
         # Regular validation and model saving
         if (n_iter + 1) % cfg.train.eval_iters == 0 or (n_iter + 1) == cfg.train.max_iters:
-            val_all_acc4, val_avg_acc4, fuse234_score, val_cls_loss = validate(
+            val_mIoU, val_mean_dice, val_fw_iu, val_iu_per_class, val_dice_per_class = validate(
                 model=model,
                 data_loader=val_loader,
                 cfg=cfg,
                 cls_loss_func=loss_function
-            )   
-            print("Validation results:")
-            print(f"Val all acc4: {val_all_acc4:.6f}")
-            print(f"Val avg acc4: {val_avg_acc4:.6f}")
+            )
 
-            current_miou = fuse234_score[:-1].mean().item()
-            print(f"Fuse234 score: {fuse234_score}, mIOU: {current_miou:.4f}")
-            
+            print("Validation results:")
+            print(f"Val mIoU: {val_mIoU:.4f}")
+            print(f"Val Mean Dice: {val_mean_dice:.4f}")
+            print(f"Val FwIU: {val_fw_iu:.4f}")
+
+            # The variable current_miou is now just val_mIoU
+            current_miou = val_mIoU
+            print(f"mIOU (for saving): {current_miou:.4f}")
+
             # Define a grace period, one epoch
             saving_grace_period = cfg.train.eval_iters
 
@@ -331,23 +334,29 @@ def train(cfg):
     print("\n1. Testing on test dataset...")
     print("-" * 50)
     
-    test_all_acc4, test_avg_acc4, fuse234_score, test_cls_loss = validate(
-                model=model,
-                data_loader=test_loader,
-                cfg=cfg,
-                cls_loss_func=loss_function)   
+    test_mIoU, test_mean_dice, test_fw_iu, test_iu_per_class, test_dice_per_class = validate(
+        model=model,
+        data_loader=test_loader,
+        cfg=cfg,
+        cls_loss_func=loss_function
+    )   
 
-    
     print("Testing results:")
-    print(f"Test all acc4: {test_all_acc4:.6f}")
-    print(f"Test avg acc4: {test_avg_acc4:.6f}")
-    print(f"Fuse234 score: {fuse234_score}, mIOU: {fuse234_score[:-1].mean():.4f}")
-    
-    print("\nPer-class IoU scores:")
-    for i, score in enumerate(fuse234_score[:-1]):
-        print(f"  Class {i}: {score:.6f}")
-    if len(fuse234_score) > cfg.dataset.cls_num_classes:
-        print(f"  Background: {fuse234_score[-1]:.6f}")
+    print(f"Test mIoU: {test_mIoU:.4f}")
+    print(f"Test Mean Dice: {test_mean_dice:.4f}")
+    print(f"Test FwIU: {test_fw_iu:.4f}")
+
+    print("\nPer-class IoU scores (FG classes + BG):")
+    # iu_per_class is 0-1, so multiply by 100
+    for i, score in enumerate(test_iu_per_class):
+        label = f"Class {i}" if i < len(test_iu_per_class) - 1 else "Background"
+        print(f"  {label}: {score*100:.4f}")
+
+    print("\nPer-class Dice scores (FG classes + BG):")
+    # dice_per_class is 0-1, so multiply by 100
+    for i, score in enumerate(test_dice_per_class):
+        label = f"Class {i}" if i < len(test_dice_per_class) - 1 else "Background"
+        print(f"  {label}: {score*100:.4f}")
 
     print("\n2. Generating CAMs for complete training dataset...")
     print("-" * 50)

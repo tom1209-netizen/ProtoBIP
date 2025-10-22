@@ -60,7 +60,7 @@ class ConfusionMatrixAllClass(object):
         torch.distributed.all_reduce(self.mat2)
 
     def __str__(self):
-        acc_global, acc, iu, dice, fg_bg_dice = self.compute()
+        acc_global, acc, iu, dice, fg_bg_dice, fw_iu = self.compute()
         return (
             'global correct: {:.1f}\n'
             'average row correct: {}\n'
@@ -69,7 +69,8 @@ class ConfusionMatrixAllClass(object):
             'dice: {}\n'
             'mean dice: {}\n'
             'fg_bg_dice: {}\n'
-            'mean_fg_bg: {}').format(
+            'mean_fg_bg: {}\n'
+            'fw_iu: {:.1f}').format(
                 acc_global.item() * 100,
                 ['{:.1f}'.format(i) for i in (acc * 100).tolist()],
                 ['{:.1f}'.format(i) for i in (iu * 100).tolist()],
@@ -77,7 +78,8 @@ class ConfusionMatrixAllClass(object):
                 ['{:.1f}'.format(i) for i in (dice * 100).tolist()],
                 dice[:-1].mean().item() * 100,
                 ['{:.1f}'.format(i) for i in (fg_bg_dice * 100).tolist()],
-                fg_bg_dice.mean().item() * 100
+                fg_bg_dice.mean().item() * 100,
+                fw_iu.item() * 100 
             )
     
 
