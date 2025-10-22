@@ -13,7 +13,7 @@ class PolyWarmupAdamW(torch.optim.AdamW):
 
         self.__init_lr = [group['lr'] for group in self.param_groups]
 
-def step(self, closure=None):
+    def step(self, closure=None):
         ## adjust lr
         if self.global_step < self.warmup_iter:
             # Linearly ramp up from warmup_ratio * lr to lr
