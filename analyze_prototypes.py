@@ -164,9 +164,12 @@ def main(args):
             projected_learnable = model_learnable.l_fc4(prototypes_learnable).detach()
             
             # Get data from the ORIGINAL PBIP model
-            feature_map_pbip, prototypes_pbip = model_pbip(image_tensor)
-            feature_map_pbip = feature_map_pbip.detach()
-            prototypes_pbip = prototypes_pbip.detach().to(device)
+            _x_all_pbip, _ = model_pbip.encoder(image_tensor) 
+            feature_map_pbip = _x_all_pbip[3].detach()
+            _, _, _, _, _, _, _, _, prototypes_pbip, _ = model_pbip(image_tensor)
+            prototypes_pbip = prototypes_pbip.detach().to(device) 
+            
+            # Now get the projected prototypes using the PBIP model's layer
             projected_pbip = model_pbip.l_fc4(prototypes_pbip).detach()
 
         # --- 7. Create Visualization Grid ---
