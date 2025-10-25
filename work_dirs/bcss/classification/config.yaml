@@ -8,7 +8,7 @@ model:
     - 1
   label_feature_path: bcss_label_fea_pro_3333
   n_ratio: 0.5
-  num_prototypes_per_class: 3
+  num_prototypes_per_class: 10
   prototype_feature_dim: 512
 dataset:
   name: bcss
